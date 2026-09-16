@@ -38,7 +38,6 @@ type Metrics struct {
 	Success       atomic.Uint64
 	Failed        atomic.Uint64
 	BackendErrors atomic.Uint64
-	Switches      atomic.Uint64
 	StartTime     time.Time
 	LatencyMu     sync.Mutex
 	Latencies     []time.Duration
@@ -47,7 +46,6 @@ type Metrics struct {
 type LoadBalancer struct {
 	port           int
 	backends       []*Backend
-	threshold      int64
 	currIndex      atomic.Uint64
 	metrics        Metrics
 	healthInterval time.Duration
@@ -64,7 +62,7 @@ type LoadBalancer struct {
 func main() {
 	port := flag.Int("port", 3297, "")
 	rawBackends := flag.String("backends", "http://127.0.0.1:3298,http://127.0.0.1:3299,http://127.0.0.1:3300", "")
-	threshold := flag.Int64("threshold", 100, "")
+	_ = flag.Int64("threshold", 100, "retained for compatibility; unused")
 	healthInterval := flag.Duration("health-interval", 1*time.Second, "")
 	_ = flag.String("fallback", "", "retained for compatibility; unused")
 	chatCmd := flag.String("chat-cmd", "", "launcher for the ChitChat JVM; empty leaves it unsupervised")
@@ -74,7 +72,7 @@ func main() {
 	chatHot := flag.Uint64("chat-hot", 10, "proxied requests within one 200ms tick that count as a benchmark")
 	flag.Parse()
 
-	lb := NewLoadBalancer(*port, *rawBackends, *threshold, *healthInterval)
+	lb := NewLoadBalancer(*port, *rawBackends, *healthInterval)
 	go lb.healthLoop()
 	lb.warmupConnections()
 
@@ -116,7 +114,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("[LoadBalancer] listening on 0.0.0.0:%d (threshold=%d backends=%d)", *port, *threshold, len(lb.backends))
+	log.Printf("[LoadBalancer] listening on 0.0.0.0:%d (backends=%d)", *port, len(lb.backends))
 
 	go func() {
 		if l3000, err := listenCapped("0.0.0.0:3000"); err == nil {
@@ -164,10 +162,9 @@ func listenCapped(addr string) (net.Listener, error) {
 	return lc.Listen(context.Background(), "tcp4", addr)
 }
 
-func NewLoadBalancer(port int, rawBackends string, threshold int64, healthInterval time.Duration) *LoadBalancer {
+func NewLoadBalancer(port int, rawBackends string, healthInterval time.Duration) *LoadBalancer {
 	lb := &LoadBalancer{
 		port:           port,
-		threshold:      threshold,
 		healthInterval: healthInterval,
 		healthClient:   &http.Client{Timeout: 2 * time.Second},
 		bufPool:        newBufferPool(),
@@ -297,42 +294,6 @@ func readAllInto(dst []byte, r io.Reader) ([]byte, error) {
 	}
 }
 
-// selectBackend uses least-connections, which tracks real service capacity far
-// better than round-robin when every backend is pinned to a single core.
-// Round-robin keeps feeding a node that is already queueing; this does not.
-func (lb *LoadBalancer) selectBackend() *Backend {
-	n := len(lb.backends)
-	if n == 0 {
-		return nil
-	}
-
-	// Rotate the scan start so equal in-flight counts fall back to round-robin
-	// instead of always landing on backends[0].
-	start := int(lb.currIndex.Add(1))
-	var best *Backend
-	var bestLoad int64
-	for i := 0; i < n; i++ {
-		b := lb.backends[(start+i)%n]
-		if !b.Alive.Load() {
-			continue
-		}
-		load := b.InFlight.Load()
-		if best == nil || load < bestLoad {
-			best, bestLoad = b, load
-		}
-	}
-
-	if best == nil {
-		// Everything is marked down; still forward rather than drop the request.
-		lb.metrics.Switches.Add(1)
-		return lb.backends[start%n]
-	}
-	if bestLoad >= lb.threshold {
-		lb.metrics.Switches.Add(1)
-	}
-	return best
-}
-
 func (lb *LoadBalancer) healthLoop() {
 	ticker := time.NewTicker(lb.healthInterval)
 	defer ticker.Stop()
@@ -391,24 +352,6 @@ func (lb *LoadBalancer) warmupConnections() {
 	wg.Wait()
 }
 
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rec *statusRecorder) WriteHeader(code int) {
-	rec.statusCode = code
-	rec.ResponseWriter.WriteHeader(code)
-}
-
-func (rec *statusRecorder) Flush() {
-	if f, ok := rec.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-var recorderPool = sync.Pool{New: func() interface{} { return new(statusRecorder) }}
-
 // hopHeaders are per-connection and must not be forwarded.
 var hopHeaders = []string{
 	"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate",
@@ -431,12 +374,17 @@ func (lb *LoadBalancer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	var body []byte
 	if r.Body != nil {
-		b, err := readAllInto((*bodyBuf)[:0], io.LimitReader(r.Body, maxRetryBody))
+		b, err := readAllInto((*bodyBuf)[:0], io.LimitReader(r.Body, maxRetryBody+1))
 		*bodyBuf = b
 		_ = r.Body.Close()
 		if err != nil {
 			lb.metrics.Failed.Add(1)
 			http.Error(w, "read error", http.StatusBadRequest)
+			return
+		}
+		if len(b) > maxRetryBody {
+			lb.metrics.Failed.Add(1)
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		body = b
@@ -523,7 +471,10 @@ func (lb *LoadBalancer) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "all backends failed", http.StatusBadGateway)
 }
 
-// selectBackendExcluding is least-connections over the nodes not yet tried.
+// selectBackendExcluding picks the backend with the fewest in-flight requests
+// (least-connections) among those not yet tried for this request. The scan
+// starts at a rotating index, so backends with equal load take turns. A backend
+// marked down is heavily deprioritised but still used if nothing else is left.
 func (lb *LoadBalancer) selectBackendExcluding(tried map[*Backend]bool) *Backend {
 	n := len(lb.backends)
 	startIdx := int(lb.currIndex.Add(1))
@@ -593,7 +544,6 @@ func (lb *LoadBalancer) resetHandler(w http.ResponseWriter, r *http.Request) {
 	lb.metrics.Success.Store(0)
 	lb.metrics.Failed.Store(0)
 	lb.metrics.BackendErrors.Store(0)
-	lb.metrics.Switches.Store(0)
 	lb.metrics.StartTime = time.Now()
 	for _, b := range lb.backends {
 		b.TotalReqs.Store(0)
@@ -701,9 +651,7 @@ func (lb *LoadBalancer) lbStatusHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"threshold": lb.threshold,
-		"switches":  lb.metrics.Switches.Load(),
-		"backends":  list,
+		"backends": list,
 	})
 }
 
@@ -738,7 +686,6 @@ func (lb *LoadBalancer) lbMetricsHandler(w http.ResponseWriter, r *http.Request)
 		"success":        lb.metrics.Success.Load(),
 		"failed":         lb.metrics.Failed.Load(),
 		"backend_errors": lb.metrics.BackendErrors.Load(),
-		"switches":       lb.metrics.Switches.Load(),
 		"throughput_rps": rps,
 		"sampled":        len(latencies),
 		"mean_ms":        mean,

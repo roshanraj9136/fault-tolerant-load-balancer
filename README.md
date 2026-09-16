@@ -1,6 +1,6 @@
 # Fault-Tolerant HTTP Load Balancer in Go
 
-A reverse-proxy load balancer, a replicated message service behind it, and a load generator. All of it is plain Go on the standard library, plus `lib/pq` for PostgreSQL.
+A least-connections reverse-proxy load balancer, a replicated message service behind it, and a load generator. All of it is plain Go on the standard library, plus `lib/pq` for PostgreSQL.
 
 I built it for the Distributed Systems Lab at IIT Bhilai. It runs on four Linux containers, each hard-capped at **1 CPU and 512 MiB of memory**. A graded harness drove the load, ramping up to 2,500 concurrent users.
 
@@ -9,7 +9,7 @@ I built it for the Distributed Systems Lab at IIT Bhilai. It runs on four Linux 
                            │
                            ▼
               ┌─────────────────────────┐
-              │   loadbalancer  :3297   │  round-robin + least-in-flight fallback
+              │   loadbalancer  :3297   │  least-connections routing
               │                         │  active health checks, retry, metrics
               └────┬─────────┬──────────┘
                    │         │          │
@@ -26,16 +26,17 @@ I built it for the Distributed Systems Lab at IIT Bhilai. It runs on four Linux 
 ## Load balancer (`loadbalancer/`)
 
 **Routing**
-- Round-robin over the healthy backends.
-- If the chosen backend already has more in-flight requests than `-threshold`, the request goes to the backend with the fewest in-flight requests instead.
+- Least-connections: each request goes to the backend with the fewest in-flight requests.
+- The scan starts at a rotating index, so backends with equal load take turns.
+- A backend that is marked down is heavily deprioritised, but is still used if no other backend is left.
 
 **Health**
 - An active `/health` probe runs every `-health-interval`.
 - A backend is marked down after 3 consecutive failed probes, and back up on the next successful one.
 
 **Retry**
-- Request bodies are buffered, up to 1 MiB.
-- If a backend fails before any response bytes reach the client, the request is retried on another healthy backend.
+- Request bodies are buffered, up to 1 MiB. Larger bodies are rejected with `413`.
+- If a backend returns a connection error or a 5xx before any response bytes reach the client, the request is retried on a backend it has not tried yet.
 - Once headers are committed, it is not retried.
 
 **Connections**
@@ -141,7 +142,7 @@ DB="postgres://postgres:postgres@127.0.0.1:5432/lb?sslmode=disable"   # the data
 ./bin/backend -name backend-2 -port 3299 -db "$DB" -peers http://127.0.0.1:3298,http://127.0.0.1:3300 &
 ./bin/backend -name backend-3 -port 3300 -db "$DB" -peers http://127.0.0.1:3298,http://127.0.0.1:3299 &
 
-./bin/loadbalancer -port 3297 -backends http://127.0.0.1:3298,http://127.0.0.1:3299,http://127.0.0.1:3300 -threshold 100 &
+./bin/loadbalancer -port 3297 -backends http://127.0.0.1:3298,http://127.0.0.1:3299,http://127.0.0.1:3300 &
 
 ./bin/client -url http://127.0.0.1:3297 -requests 5000 -concurrency 40
 curl http://127.0.0.1:3297/lb/metrics
