@@ -1,0 +1,3 @@
+Experiment,Requests,Concurrency,Successful,Failed,Throughput_RPS,Dropout_Percent,p50_ms,p95_ms,p99_ms,Timestamp
+1 Backend,5000,50,5000,0,322.37,0.00%,152.31 ms,156.48 ms,184.16 ms,2026-08-23T15:39:34Z
+3 Backends,5000,50,5000,0,325.45,0.00%,151.98 ms,154.65 ms,160.71 ms,2026-08-23T15:39:53Z

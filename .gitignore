@@ -1,0 +1,7 @@
+# Binaries
+/bin/
+*.exe
+
+# Local data and logs
+*.db
+*.log
