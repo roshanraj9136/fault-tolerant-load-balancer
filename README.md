@@ -1,5 +1,7 @@
 # Fault-Tolerant HTTP Load Balancer in Go
 
+[![CI](https://github.com/roshanraj9136/fault-tolerant-load-balancer/actions/workflows/ci.yml/badge.svg)](https://github.com/roshanraj9136/fault-tolerant-load-balancer/actions/workflows/ci.yml)
+
 A least-connections reverse-proxy load balancer, a replicated message service behind it, and a load generator. All of it is plain Go on the standard library, plus `lib/pq` for PostgreSQL.
 
 I built it for the Distributed Systems Lab at IIT Bhilai. It runs on four Linux containers, each hard-capped at **1 CPU and 512 MiB of memory**. A graded harness drove the load, ramping up to 2,500 concurrent users.
