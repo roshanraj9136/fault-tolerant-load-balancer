@@ -65,7 +65,7 @@ func main() {
 		MaxIdleConns:        *concurrency * 3,
 		MaxIdleConnsPerHost: *concurrency * 3,
 		IdleConnTimeout:     60 * time.Second,
-		DisableCompression: true,
+		DisableCompression:  true,
 	}
 	client := &http.Client{
 		Transport: transport,
@@ -86,7 +86,7 @@ func main() {
 		go func(workerID int) {
 			defer wg.Done()
 			clientName := fmt.Sprintf("user-%d", workerID+1)
-			localLat := make([]time.Duration, 0, (*requests / *concurrency) + 10)
+			localLat := make([]time.Duration, 0, (*requests / *concurrency)+10)
 
 			for jobID := range jobs {
 				diff := *maxIntervalMs - *minIntervalMs
